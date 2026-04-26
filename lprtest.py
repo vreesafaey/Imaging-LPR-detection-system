@@ -12,6 +12,13 @@ import easyocr
 import re
 import threading
 import os
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message=".*pin_memory.*MPS.*",
+    category=UserWarning,
+)
 
 # =============================================
 # GLOBAL COLOR SCHEME
@@ -35,27 +42,212 @@ COLORS = {
 # MALAYSIAN STATE MAPPING
 # =============================================
 STATE_MAP = {
-    "B": "Selangor", 
-    "W": "Kuala Lumpur", "V" : "Kuala Lumpur",
+    # State/Territory prefixes
+    "A": "Perak",
+    "B": "Selangor",
+    "C": "Pahang",
+    "D": "Kelantan",
+    "F": "Putrajaya",
     "J": "Johor",
     "K": "Kedah",
-    "D": "Kelantan",
-    "M": "Melaka",
-    "N": "Negeri Sembilan", 
-    "C": "Pahang", 
-    "P": "Penang", 
-    "A": "Perak", 
-    "R": "Perlis",
-    "S": "Sabah", 
-    "Q": "Sarawak",
-    "T": "Terengganu",
-    "F": "Putrajaya",
+    "KV": "Langkawi",
     "L": "Labuan",
-    "AT": "Military", "AM": "Military",
+    "M": "Malacca",
+    "N": "Negeri Sembilan",
+    "P": "Penang",
+    "R": "Perlis",
+    "T": "Terengganu",
+    "V": "Kuala Lumpur",
+    "W": "Kuala Lumpur",
+
+    # Sabah division prefixes
+    "SA": "Sabah - West Coast",
+    "SY": "Sabah - West Coast",
+    "SJ": "Sabah - West Coast / Kota Kinabalu",
+    "SG": "Sabah Government",
+    "SMJ": "Sabah Government",
+    "SS": "Sabah - Sandakan",
+    "SM": "Sabah - Sandakan",
+    "SB": "Sabah - Beaufort",
+    "SK": "Sabah - Kudat",
+    "ST": "Sabah - Tawau",
+    "SW": "Sabah - Tawau",
+    "SD": "Sabah - Lahad Datu",
+    "SP": "Sabah - Lahad Datu",
+    "SL": "Sabah - Labuan",
+    "SU": "Sabah - Keningau",
+    "S": "Sabah",
+
+    # Sarawak division prefixes
+    "QK": "Sarawak - Kuching",
+    "QA": "Sarawak - Kuching",
+    "QL": "Sarawak - Limbang",
+    "QB": "Sarawak - Sri Aman and Betong",
+    "QM": "Sarawak - Miri",
+    "QS": "Sarawak - Sibu and Mukah",
+    "QC": "Sarawak - Samarahan and Serian",
+    "QP": "Sarawak - Kapit",
+    "QT": "Sarawak - Bintulu",
+    "QD": "Sarawak - Bintulu",
+    "QR": "Sarawak - Sarikei",
+    "Q": "Sarawak",
+
+    # Taxi prefixes
+    "HA": "Taxi - Perak",
+    "HB": "Taxi - Selangor",
+    "HC": "Taxi - Pahang",
+    "HD": "Taxi - Kelantan",
+    "HJ": "Taxi - Johor",
+    "HK": "Taxi - Kedah",
+    "HL": "Taxi - Labuan",
+    "HM": "Taxi - Malacca",
+    "HN": "Taxi - Negeri Sembilan",
+    "HP": "Taxi - Penang",
+    "HQ": "Taxi - Sarawak",
+    "HR": "Taxi - Perlis",
+    "HS": "Taxi - Sabah",
+    "HT": "Taxi - Terengganu",
+    "HW": "Taxi - Kuala Lumpur",
+    "LIMO": "KLIA Limousine",
+
+    # Military prefixes
+    "ZA": "Military - Malaysian Army",
+    "ZB": "Military - Malaysian Army",
+    "ZC": "Military - Malaysian Army",
+    "ZD": "Military - Malaysian Army",
+    "ZL": "Military - Royal Malaysian Navy",
+    "ZU": "Military - Royal Malaysian Air Force",
+    "ZZ": "Military - Ministry of Defence",
+    "TZ": "Military - Trailer",
+    "Z": "Military - Malaysian Army",
+
+    # Foreign missions
     "CD": "Diplomatic",
+    "DC": "Diplomatic Corps",
+    "CC": "Consular Corps",
+    "UN": "United Nations",
+    "PA": "International Organisation",
+
+    # Trade plates
+    "BA": "Trade Plate - Selangor",
+    "WTP": "Trade Plate - Kuala Lumpur",
+
+    # Trailer plates
+    "TQ": "Trailer - Sarawak",
+    "TS": "Trailer - Sabah",
+    "TBD": "Trailer - Peninsular Malaysia",
+}
+
+TRADE_SUFFIX_MAP = {
+    "J": "Trade Plate - Sabah",
+    "Q": "Trade Plate - Sarawak",
 }
 
 VEHICLE_TYPES = ["Car", "Motorcycle", "Bus", "Truck", "Van"]
+PLATE_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+DIGIT_CONFUSIONS = str.maketrans({
+    "I": "1",
+    "L": "1",
+    "O": "0",
+    "Q": "0",
+    "S": "5",
+    "B": "8",
+    "G": "6",
+})
+DIGIT_CONFUSION_CHARS = set("ILOQSBG")
+NOISY_LEADING_PREFIXES = {"ZA", "ZB", "ZC", "ZD", "ZL", "ZU", "ZZ", "TZ"}
+
+
+def normalize_plate_text(text):
+    """Keep only characters that can belong to a Malaysian plate."""
+    clean = re.sub(r"[^A-Z0-9]", "", text.upper())
+    if not clean:
+        return ""
+
+    prefixes = sorted(STATE_MAP, key=len, reverse=True)
+
+    def normalize_known_prefix(prefix, remainder):
+        if not remainder:
+            return prefix
+
+        first_digit = next((i for i, ch in enumerate(remainder) if ch.isdigit()), None)
+        if first_digit is None:
+            return prefix + remainder
+
+        letters = remainder[:first_digit]
+        digits = remainder[first_digit:].translate(DIGIT_CONFUSIONS)
+
+        # Military plates such as ZD1-2447 are often OCR'd as ZDI-2447.
+        if len(prefix) >= 2 and len(letters) == 1 and letters in DIGIT_CONFUSION_CHARS:
+            return prefix + letters.translate(DIGIT_CONFUSIONS) + digits
+
+        return prefix + letters + digits
+
+    for prefix in prefixes:
+        if clean.startswith(prefix) and len(clean) > len(prefix):
+            return normalize_known_prefix(prefix, clean[len(prefix):])
+
+        # Recover leading OCR noise like IZD12447 without dropping legitimate
+        # front letters from plates such as VCF2025 or TCB5944.
+        prefix_at = clean.find(prefix)
+        if (
+            len(prefix) >= 2
+            and 0 < prefix_at <= 2
+            and (
+                set(clean[:prefix_at]).issubset({"I", "1", "L"})
+                or prefix in NOISY_LEADING_PREFIXES
+            )
+            and len(clean) > prefix_at + len(prefix)
+        ):
+            return normalize_known_prefix(prefix, clean[prefix_at + len(prefix):])
+
+    match = re.match(r"^([A-Z]{1,3})([A-Z0-9]+)$", clean)
+    if match and any(ch.isdigit() for ch in match.group(2)):
+        letters, remainder = match.groups()
+        first_digit = next((i for i, ch in enumerate(remainder) if ch.isdigit()), 0)
+        return letters + remainder[:first_digit] + remainder[first_digit:].translate(DIGIT_CONFUSIONS)
+
+    return clean
+
+
+def is_probable_plate_text(text):
+    clean = normalize_plate_text(text)
+    if not 3 <= len(clean) <= 10:
+        return False
+    if not re.search(r"[A-Z]", clean) or not re.search(r"\d", clean):
+        return False
+
+    patterns = [
+        r"^[A-Z]{1,4}\d{1,5}[A-Z]?$",   # WAA1234, ZD12447, SMJ1234
+        r"^\d{1,5}[A-Z]{1,3}$",          # trade and some special plates
+        r"^\d{1,3}[A-Z]{1,3}\d{1,4}[A-Z]{0,3}$",
+    ]
+    return any(re.match(pattern, clean) for pattern in patterns)
+
+
+def clamp_box(x, y, w, h, img_shape):
+    ih, iw = img_shape[:2]
+    x = max(0, min(int(x), iw - 1))
+    y = max(0, min(int(y), ih - 1))
+    w = max(1, min(int(w), iw - x))
+    h = max(1, min(int(h), ih - y))
+    return x, y, w, h
+
+
+def expand_box(box, img_shape, x_scale=0.18, y_scale=0.45):
+    x, y, w, h = box
+    pad_x = max(6, int(w * x_scale))
+    pad_y = max(5, int(h * y_scale))
+    return clamp_box(x - pad_x, y - pad_y, w + 2 * pad_x, h + 2 * pad_y, img_shape)
+
+
+def overlap_ratio(box_a, box_b):
+    ax, ay, aw, ah = box_a
+    bx, by, bw, bh = box_b
+    ox = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+    oy = max(0, min(ay + ah, by + bh) - max(ay, by))
+    smaller = max(1, min(aw * ah, bw * bh))
+    return (ox * oy) / smaller
 
 
 # =============================================
@@ -76,7 +268,7 @@ def preprocess(img):
     return resized, gray, enhanced, edges, closed
 
 
-def detect_plates(resized, closed):
+def detect_plates(resized, closed, min_area=0.003):
     """Find candidate plate regions via contour analysis."""
     contours, _ = cv2.findContours(closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     candidates = []
@@ -87,7 +279,7 @@ def detect_plates(resized, closed):
         aspect = cw / float(ch) if ch > 0 else 0
         area_ratio = (cw * ch) / (w * h)
 
-        if 1.5 < aspect < 7.0 and 0.003 < area_ratio < 0.15:
+        if 1.4 < aspect < 8.5 and min_area < area_ratio < 0.15:
             candidates.append((x, y, cw, ch))
 
     # Keep largest and remove heavy overlaps
@@ -109,6 +301,263 @@ def detect_plates(resized, closed):
     return filtered[:8]
 
 
+def detect_dark_plate_regions(resized, min_area=0.003):
+    """Find dark horizontal regions such as black Malaysian plates."""
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape[:2]
+
+    black = cv2.inRange(gray, 0, 95)
+    horizontal = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 5))
+    vertical = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+    mask = cv2.morphologyEx(black, cv2.MORPH_CLOSE, horizontal, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, vertical, iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
+
+    for cnt in contours:
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        aspect = cw / float(ch) if ch > 0 else 0
+        area_ratio = (cw * ch) / (w * h)
+
+        if not (1.6 < aspect < 8.5 and min_area < area_ratio < 0.12):
+            continue
+
+        crop = gray[y:y + ch, x:x + cw]
+        if crop.size == 0:
+            continue
+
+        darkness = 1.0 - (float(np.mean(crop)) / 255.0)
+        if darkness < 0.35:
+            continue
+
+        candidates.append(expand_box((x, y, cw, ch), resized.shape, 0.08, 0.25))
+
+    candidates = sorted(candidates, key=lambda b: b[2] * b[3], reverse=True)
+    filtered = []
+    for box in candidates:
+        if all(overlap_ratio(box, other) <= 0.55 for other in filtered):
+            filtered.append(box)
+    return filtered[:8]
+
+
+def detect_bright_text_regions(resized, min_area=0.0002):
+    """Find grouped bright plate characters on dark backgrounds."""
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape[:2]
+    candidates = []
+
+    for threshold in (150, 175):
+        bright = cv2.inRange(gray, threshold, 255)
+        close = cv2.morphologyEx(
+            bright,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (17, 5)),
+            iterations=2,
+        )
+        close = cv2.morphologyEx(
+            close,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            iterations=1,
+        )
+
+        contours, _ = cv2.findContours(close, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            aspect = cw / float(ch) if ch > 0 else 0
+            area_ratio = (cw * ch) / (w * h)
+
+            if not (1.4 < aspect < 10.0 and min_area < area_ratio < 0.035 and 12 < ch < 120):
+                continue
+
+            box = expand_box((x, y, cw, ch), resized.shape, 0.25, 0.80)
+            bx, by, bw, bh = box
+            crop = gray[by:by + bh, bx:bx + bw]
+            if crop.size == 0:
+                continue
+
+            dark_fraction = float(np.mean(crop < 85))
+            bright_fraction = float(np.mean(crop > threshold))
+            if dark_fraction < 0.45 or bright_fraction < 0.04:
+                continue
+
+            score = dark_fraction + bright_fraction + min(aspect / 6.0, 1.0)
+            candidates.append((score, box))
+
+    candidates = sorted(candidates, key=lambda item: item[0], reverse=True)
+    filtered = []
+    for _, box in candidates:
+        if all(overlap_ratio(box, other) <= 0.55 for other in filtered):
+            filtered.append(box)
+    return filtered[:8]
+
+
+def _readtext(reader, image, detail=0):
+    kwargs = {
+        "detail": detail,
+        "allowlist": PLATE_ALLOWLIST,
+        "paragraph": False,
+    }
+    try:
+        return reader.readtext(image, **kwargs)
+    except TypeError:
+        kwargs.pop("paragraph", None)
+        return reader.readtext(image, **kwargs)
+
+
+def _merge_ocr_line(results):
+    fragments = []
+    for result in results:
+        if len(result) < 2:
+            continue
+
+        pts = np.array(result[0], dtype=np.float32)
+        text = normalize_plate_text(result[1])
+        confidence = float(result[2]) if len(result) > 2 else 0.0
+        if not text:
+            continue
+
+        x, y, w, h = cv2.boundingRect(pts.astype(np.int32))
+        fragments.append({
+            "box": (x, y, w, h),
+            "text": text,
+            "confidence": confidence,
+        })
+
+    if not fragments:
+        return "", 0.0
+
+    fragments = sorted(fragments, key=lambda item: item["box"][0])
+    grouped = []
+    for fragment in fragments:
+        x, y, w, h = fragment["box"]
+        cy = y + h / 2.0
+        added = False
+        for group in grouped:
+            gy = np.mean([item["box"][1] + item["box"][3] / 2.0 for item in group])
+            gh = max(item["box"][3] for item in group)
+            if abs(cy - gy) <= max(h, gh) * 1.2:
+                group.append(fragment)
+                added = True
+                break
+        if not added:
+            grouped.append([fragment])
+
+    best_text = ""
+    best_score = -1.0
+    best_confidence = 0.0
+    for group in grouped:
+        group = sorted(group, key=lambda item: item["box"][0])
+        text = normalize_plate_text("".join(item["text"] for item in group))
+        confidence = float(np.mean([item["confidence"] for item in group]))
+        score = len(text) + confidence * 3.0
+        if is_probable_plate_text(text):
+            score += 6.0
+        if score > best_score:
+            best_text = text
+            best_score = score
+            best_confidence = confidence
+
+    return best_text, best_confidence
+
+
+def detect_ocr_plate_regions(resized, reader):
+    """Use EasyOCR's rotated text boxes as plate candidates for angled views."""
+    regions = []
+    fragments = []
+
+    try:
+        results = _readtext(reader, resized, detail=1)
+    except Exception:
+        return regions
+
+    for result in results:
+        if len(result) < 2:
+            continue
+
+        poly, text = result[0], result[1]
+        confidence = float(result[2]) if len(result) > 2 else 0.0
+        clean = normalize_plate_text(text)
+        if not clean:
+            continue
+
+        pts = np.array(poly, dtype=np.float32)
+        x, y, w, h = cv2.boundingRect(pts.astype(np.int32))
+        box = expand_box((x, y, w, h), resized.shape)
+        fragments.append({
+            "box": box,
+            "poly": pts.astype(np.int32),
+            "text": clean,
+            "confidence": confidence,
+        })
+
+        if is_probable_plate_text(clean):
+            regions.append({
+                "box": box,
+                "poly": pts.astype(np.int32),
+                "text": clean,
+                "confidence": confidence,
+                "source": "ocr",
+            })
+
+    # EasyOCR can split angled plates into chunks such as "ZD1" and "2447".
+    fragments = sorted(fragments, key=lambda item: (item["box"][1], item["box"][0]))
+    for i, first in enumerate(fragments):
+        group = [first]
+        fx, fy, fw, fh = first["box"]
+        first_cy = fy + fh / 2.0
+
+        for second in fragments[i + 1:]:
+            sx, sy, sw, sh = second["box"]
+            second_cy = sy + sh / 2.0
+            height = max(fh, sh)
+            gap = sx - (fx + fw)
+            same_line = abs(first_cy - second_cy) < height * 1.1
+            near_enough = -height < gap < height * 5.0
+            if same_line and near_enough:
+                group.append(second)
+                fx, fy, fw, fh = second["box"]
+
+        if len(group) < 2:
+            continue
+
+        group = sorted(group, key=lambda item: item["box"][0])
+        merged_text = "".join(item["text"] for item in group)
+        if not is_probable_plate_text(merged_text):
+            continue
+
+        xs = [item["box"][0] for item in group]
+        ys = [item["box"][1] for item in group]
+        xe = [item["box"][0] + item["box"][2] for item in group]
+        ye = [item["box"][1] + item["box"][3] for item in group]
+        merged_box = expand_box(
+            (min(xs), min(ys), max(xe) - min(xs), max(ye) - min(ys)),
+            resized.shape,
+            0.08,
+            0.20,
+        )
+        merged_poly = cv2.convexHull(np.vstack([item["poly"] for item in group]))
+        regions.append({
+            "box": merged_box,
+            "poly": merged_poly,
+            "text": merged_text,
+            "confidence": float(np.mean([item["confidence"] for item in group])),
+            "source": "ocr-merged",
+        })
+
+    regions = sorted(
+        regions,
+        key=lambda item: (len(item["text"]), item["confidence"]),
+        reverse=True,
+    )
+    filtered = []
+    for region in regions:
+        if all(overlap_ratio(region["box"], other["box"]) <= 0.65 for other in filtered):
+            filtered.append(region)
+    return filtered[:8]
+
+
 def extract_plate_text(img_bgr, box, reader):
     """Crop, enhance, and run OCR on a single plate candidate."""
     x, y, w, h = box
@@ -127,20 +576,64 @@ def extract_plate_text(img_bgr, box, reader):
         crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(gray)
+    _, binary = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    inverted = cv2.bitwise_not(binary)
 
-    results = reader.readtext(binary, detail=0, allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-    return " ".join(results).upper().replace(" ", "")
+    options = []
+    for variant in (crop, clahe, binary, inverted):
+        try:
+            results = _readtext(reader, variant, detail=1)
+        except Exception:
+            continue
+
+        merged_text, merged_confidence = _merge_ocr_line(results)
+        if merged_text:
+            options.append((merged_text, merged_confidence))
+
+        for result in results:
+            if len(result) < 2:
+                continue
+            text = normalize_plate_text(result[1])
+            confidence = float(result[2]) if len(result) > 2 else 0.0
+            if text:
+                options.append((text, confidence))
+
+    if not options:
+        return ""
+
+    options = sorted(
+        options,
+        key=lambda item: (is_probable_plate_text(item[0]), len(item[0]), item[1]),
+        reverse=True,
+    )
+    return options[0][0]
 
 
 def identify_state(plate_text):
     """Match longest prefix first for accurate state identification."""
-    plate_text = re.sub(r"[^A-Z]", "", plate_text.upper())
-    for length in [3, 2, 1]:
-        prefix = plate_text[:length]
-        if prefix in STATE_MAP:
+    alnum_text = normalize_plate_text(plate_text)
+    for suffix, state in TRADE_SUFFIX_MAP.items():
+        if re.match(r"^[A-Z]{0,2}\d+[A-Z]?$", alnum_text) and alnum_text.endswith(suffix):
+            return state, suffix
+
+    plate_text = re.sub(r"[^A-Z]", "", alnum_text)
+    for prefix in sorted(STATE_MAP, key=len, reverse=True):
+        if plate_text.startswith(prefix):
             return STATE_MAP[prefix], prefix
     return "No Plate Detected", ""
+
+
+def candidate_score(text, state, confidence=0.0):
+    clean = normalize_plate_text(text)
+    score = len(clean) + float(confidence) * 3.0
+    if is_probable_plate_text(clean):
+        score += 5.0
+    if state != "No Plate Detected":
+        score += 4.0
+    if re.match(r"^Z[A-Z]{0,2}\d{3,5}$", clean):
+        score += 2.0
+    return score
 
 
 def classify_vehicle(boxes, img_shape):
@@ -408,29 +901,50 @@ class LPRApp(tk.Tk):
 
     def _detect_thread(self):
         try:
-            # ... (Your original detection logic remains the same)
-            # I've kept the full logic identical for correctness
-
             img = self.orig_img.copy()
             resized, gray, enhanced, edges, closed = preprocess(img)
             min_area = self.area_var.get() / 100.0
-            boxes = detect_plates(resized, closed)
+            contour_boxes = detect_plates(resized, closed, min_area)
+            dark_boxes = detect_dark_plate_regions(resized, min_area)
+            bright_boxes = detect_bright_text_regions(resized)
+            ocr_regions = detect_ocr_plate_regions(resized, self.reader)
+
+            plate_regions = list(ocr_regions)
+            image_regions = []
+            for box in bright_boxes + contour_boxes + dark_boxes:
+                if all(overlap_ratio(box, region["box"]) <= 0.65 for region in image_regions):
+                    image_regions.append({
+                        "box": box,
+                        "poly": None,
+                        "text": "",
+                        "confidence": 0.0,
+                        "source": "image",
+                    })
+            plate_regions.extend(image_regions)
+            plate_regions = plate_regions[:14]
+            boxes = [region["box"] for region in plate_regions]
 
             draw = resized.copy()
             candidates = []
             best_text = ""
             best_state = "Unknown"
             best_prefix = ""
+            best_score = -1.0
 
-            for box in boxes:
-                text = extract_plate_text(resized, box, self.reader)
+            for region in plate_regions:
+                box = region["box"]
+                text = region.get("text") or extract_plate_text(resized, box, self.reader)
+                text = normalize_plate_text(text)
                 if len(text) < 3:
                     continue
                 state, prefix = identify_state(text)
+                score = candidate_score(text, state, region.get("confidence", 0.0))
                 candidates.append((text, state))
 
                 x, y, w, h = box
-                color = (0, 255, 100) if state != "Unknown" else (0, 180, 255)
+                color = (0, 255, 100) if state != "No Plate Detected" else (0, 180, 255)
+                if region.get("poly") is not None:
+                    cv2.polylines(draw, [region["poly"].astype(np.int32)], True, color, 2)
                 cv2.rectangle(draw, (x, y), (x + w, y + h), color, 2)
                 label = f"{text} | {state}"
                 (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
@@ -438,7 +952,8 @@ class LPRApp(tk.Tk):
                 cv2.putText(draw, label, (x + 4, y - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
 
-                if not best_text and state != "Unknown":
+                if score > best_score:
+                    best_score = score
                     best_text, best_state, best_prefix = text, state, prefix
 
             if not best_text and candidates:
