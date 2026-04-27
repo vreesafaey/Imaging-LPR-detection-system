@@ -17,16 +17,16 @@ import os
 # GLOBAL COLOR SCHEME
 # =============================================
 COLORS = {
-    "background": "#f9f8f3",      # Main background
-    "foreground": "#6d325c",     # Top bar, canvas
+    "background": "#6d325c",      # Main background
+    "foreground": "#f9f8f3",     # Top bar, canvas
     "accent_blue": "#6d325c",
     "accent_green": "#a6e3a1",
     "accent_pink": "#f38ba8",
     "accent_yellow": "#fab387",
     "accent_purple": "#cba6f7",
-    "text_primary": "#a6e3a1",
-    "text_secondary": "#000000",
-    "text_muted": "#000000",
+    "text_primary": "#556253",
+    "text_secondary": "#FFFFFF",
+    "text_muted": "#FFFFFF",
     "text_highlight": "#f9e2af",
     "error": "#f38ba8",
 }
@@ -222,7 +222,7 @@ class LPRApp(tk.Tk):
 
     def _build_controls(self, parent):
         tk.Label(parent, text="Controls", font=("Segoe UI", 12, "bold"),
-                 fg=COLORS["text_primary"], bg=COLORS["background"]).pack(pady=(16, 8))
+                 fg=COLORS["text_secondary"], bg=COLORS["background"]).pack(pady=(16, 8))
 
         btn_style = {
             "font": ("Segoe UI", 10),
@@ -286,7 +286,7 @@ class LPRApp(tk.Tk):
 
     def _build_results(self, parent):
         tk.Label(parent, text="Detection results", font=("Segoe UI", 12, "bold"),
-                 fg=COLORS["text_primary"], bg=COLORS["background"]).pack(pady=(16, 8), padx=16, anchor="w")
+                 fg=COLORS["text_secondary"], bg=COLORS["background"]).pack(pady=(16, 8), padx=16, anchor="w")
 
         self.plate_var = tk.StringVar(value="—")
         self.state_var = tk.StringVar(value="—")
