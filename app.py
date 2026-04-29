@@ -642,6 +642,40 @@ def candidate_score(text, state, confidence=0.0):
     return score
 
 
+def plate_position_score(box, img_shape):
+    """Prefer the lower bumper/front regions where bus/car plates usually sit."""
+    x, y, w, h = box
+    ih, iw = img_shape[:2]
+    center_y = (y + h / 2.0) / float(max(1, ih))
+    width_ratio = w / float(max(1, iw))
+
+    score = 0.0
+    if center_y > 0.52:
+        score += 1.2
+    elif center_y < 0.35:
+        score -= 1.5
+
+    if width_ratio > 0.28 and center_y < 0.70:
+        score -= 1.2
+    return score
+
+
+def is_suspicious_non_plate_region(text, box, img_shape, source="image"):
+    """Reject short OCR text from large upper/mid vehicle branding or windows."""
+    clean = normalize_plate_text(text)
+    x, y, w, h = box
+    ih, iw = img_shape[:2]
+    center_y = (y + h / 2.0) / float(max(1, ih))
+    width_ratio = w / float(max(1, iw))
+    area_ratio = (w * h) / float(max(1, iw * ih))
+
+    if source.startswith("ocr") and center_y < 0.34:
+        return True
+    if len(clean) <= 5 and center_y < 0.72 and (width_ratio > 0.18 or area_ratio > 0.012):
+        return True
+    return False
+
+
 def is_plausible_plate_box(box, img_shape, source="image"):
     x, y, w, h = box
     ih, iw = img_shape[:2]
@@ -684,11 +718,13 @@ def classify_vehicle(boxes, img_shape):
     ih, iw = img_shape[:2]
     x, y, bw, bh = boxes[0]
     aspect = bw / float(bh) if bh > 0 else 1
+    width_ratio = bw / float(max(1, iw))
+    height_ratio = bh / float(max(1, ih))
     plate_y_ratio = (y + bh) / ih
 
     if aspect > 5 and plate_y_ratio > 0.85:
         return "Bus / Truck"
-    if aspect < 2.5:
+    if aspect < 2.5 and width_ratio > 0.10 and height_ratio > 0.045 and plate_y_ratio < 0.75:
         return "Motorcycle"
     return "Car / Van"
 # =============================================
@@ -738,8 +774,9 @@ def detect_plate(image_bgr, options=None):
     reader_instance = get_reader()
     resized, gray, enhanced, edges, closed = preprocess(image_bgr)
     min_area = float(options.get("min_area", 0.003))
-    contour_boxes = detect_plates(resized, closed, min_area)
-    dark_boxes = detect_dark_plate_regions(resized, min_area)
+    small_plate_min_area = min(min_area, 0.0008)
+    contour_boxes = detect_plates(resized, closed, small_plate_min_area)
+    dark_boxes = detect_dark_plate_regions(resized, small_plate_min_area)
     bright_boxes = detect_bright_text_regions(resized)
     ocr_regions = detect_ocr_plate_regions(resized, reader_instance)
 
@@ -794,6 +831,9 @@ def detect_plate(image_bgr, options=None):
             if anchors:
                 box = max(anchors, key=lambda b: b[2] * b[3])
 
+        if is_suspicious_non_plate_region(text, box, resized.shape, source):
+            continue
+
         if not is_strong_plate_candidate(
             text, plate_state, confidence, box, resized.shape, source
         ):
@@ -802,6 +842,9 @@ def detect_plate(image_bgr, options=None):
         score = candidate_score(text, plate_state, confidence)
         if source.startswith("ocr"):
             score += 1.0
+        score += plate_position_score(box, resized.shape)
+        if len(text) <= 5:
+            score -= 1.0
 
         filtered_candidates.append({
             "text": text,
@@ -822,7 +865,7 @@ def detect_plate(image_bgr, options=None):
     for candidate in filtered_candidates:
         if candidate["score"] < 14.0:
             continue
-        if candidate["score"] < best_candidate_score - 2.5:
+        if candidate["score"] < best_candidate_score - 1.5:
             continue
         if any(overlap_ratio(candidate["box"], other["box"]) > 0.70 for other in selected):
             continue
