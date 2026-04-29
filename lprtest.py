@@ -1,18 +1,35 @@
 """
-License Plate Recognition (LPR) & State Identification System (SIS)
-GUI built with Tkinter | Detection via OpenCV | OCR via EasyOCR
+ License Plate Recognition (LPR) & State Identification System (SIS)
+GUI built with PySide6 | Detection via OpenCV | OCR via EasyOCR
 """
 
-import tkinter as tk
-from tkinter import filedialog, ttk
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
 import easyocr
 import re
 import threading
 import os
 import warnings
+import sys
+
+from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import QFont, QImage, QPixmap
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QMainWindow,
+    QPushButton,
+    QSizePolicy,
+    QSlider,
+    QVBoxLayout,
+    QWidget,
+)
 
 warnings.filterwarnings(
     "ignore",
@@ -698,254 +715,376 @@ def classify_vehicle(boxes, img_shape):
 # GUI APPLICATION
 # =============================================
 
-class LPRApp(tk.Tk):
+class AppSignals(QObject):
+    ocr_ready = Signal(object)
+    ocr_error = Signal(str)
+    detection_ready = Signal(object)
+    detection_error = Signal(str)
+
+
+class ImagePreview(QLabel):
+    def __init__(self):
+        super().__init__("Load an image to begin")
+        self._pixmap = None
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(520, 420)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setObjectName("imagePreview")
+
+    def set_cv_image(self, img_bgr):
+        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        rgb = np.ascontiguousarray(rgb)
+        h, w, channels = rgb.shape
+        image = QImage(rgb.data, w, h, channels * w, QImage.Format_RGB888).copy()
+        self._pixmap = QPixmap.fromImage(image)
+        self.setText("")
+        self._refresh_pixmap()
+
+    def clear_image(self):
+        self._pixmap = None
+        self.clear()
+        self.setText("Load an image to begin")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_pixmap()
+
+    def _refresh_pixmap(self):
+        if self._pixmap is None:
+            return
+        scaled = self._pixmap.scaled(
+            self.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self.setPixmap(scaled)
+
+
+class LPRApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.title("License Plate Recognition & State Identification System")
-        self.configure(bg=COLORS["background"])
-        self.resizable(True, True)
-        self.minsize(1100, 700)
+        self.setWindowTitle("License Plate Recognition & State Identification System")
+        self.setMinimumSize(1100, 700)
 
-        # State variables
         self.orig_img = None
         self.result_img = None
         self.reader = None
         self.reader_loaded = False
         self._current_img_bgr = None
 
+        self.signals = AppSignals()
+        self.signals.ocr_ready.connect(self._on_ocr_ready)
+        self.signals.ocr_error.connect(self._on_ocr_error)
+        self.signals.detection_ready.connect(self._update_results)
+        self.signals.detection_error.connect(self._on_detection_error)
+
         self._build_ui()
         self._load_ocr_async()
 
     # ------------------- UI Construction -------------------
     def _build_ui(self):
-        self._build_topbar()
-        self._build_main_content()
+        self._apply_styles()
+
+        root = QWidget()
+        root.setObjectName("root")
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        self.setCentralWidget(root)
+
+        root_layout.addWidget(self._build_topbar())
+
+        main = QWidget()
+        main_layout = QHBoxLayout(main)
+        main_layout.setContentsMargins(16, 12, 16, 12)
+        main_layout.setSpacing(12)
+        root_layout.addWidget(main, 1)
+
+        main_layout.addWidget(self._build_controls())
+        main_layout.addWidget(self._build_image_area(), 1)
+        main_layout.addWidget(self._build_results())
 
     def _build_topbar(self):
-        topbar = tk.Frame(self, bg=COLORS["foreground"], pady=10)
-        topbar.pack(fill="x")
+        topbar = QFrame()
+        topbar.setObjectName("topbar")
+        layout = QHBoxLayout(topbar)
+        layout.setContentsMargins(20, 10, 20, 10)
 
-        tk.Label(topbar, text="LPR & State Identification System",
-                 font=("Segoe UI", 16, "bold"), fg=COLORS["text_primary"],
-                 bg=COLORS["foreground"]).pack(side="left", padx=20)
+        title = QLabel("LPR & State Identification System")
+        title.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        title.setObjectName("topbarTitle")
 
-        self.status_lbl = tk.Label(topbar, text="Loading OCR engine...",
-                                   font=("Segoe UI", 10), fg=COLORS["text_secondary"],
-                                   bg=COLORS["foreground"])
-        self.status_lbl.pack(side="right", padx=20)
+        self.status_lbl = QLabel("Loading OCR engine...")
+        self.status_lbl.setObjectName("statusLabel")
+        self.status_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-    def _build_main_content(self):
-        main = tk.Frame(self, bg=COLORS["background"])
-        main.pack(fill="both", expand=True, padx=16, pady=12)
+        layout.addWidget(title)
+        layout.addStretch(1)
+        layout.addWidget(self.status_lbl)
+        return topbar
 
-        # Left: Controls
-        left = tk.Frame(main, bg=COLORS["background"], width=240)
-        left.pack(side="left", fill="y", padx=(0, 12))
-        left.pack_propagate(False)
-        self._build_controls(left)
+    def _build_controls(self):
+        panel = QFrame()
+        panel.setObjectName("sidePanel")
+        panel.setFixedWidth(240)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
 
-        # Centre: Image Canvas
-        centre = tk.Frame(main, bg=COLORS["background"])
-        centre.pack(side="left", fill="both", expand=True)
-        self._build_canvas(centre)
+        heading = QLabel("Controls")
+        heading.setObjectName("sectionHeading")
+        heading.setAlignment(Qt.AlignCenter)
 
-        # Right: Results
-        right = tk.Frame(main, bg=COLORS["background"], width=280)
-        right.pack(side="right", fill="y", padx=(12, 0))
-        right.pack_propagate(False)
-        self._build_results(right)
+        self.load_btn = QPushButton("Load Image")
+        self.load_btn.clicked.connect(self.load_image)
 
-    def _build_controls(self, parent):
-        tk.Label(parent, text="Controls", font=("Segoe UI", 12, "bold"),
-                 fg=COLORS["text_primary"], bg=COLORS["background"]).pack(pady=(16, 8))
+        self.run_btn = QPushButton("Run Detection")
+        self.run_btn.setEnabled(False)
+        self.run_btn.clicked.connect(self.run_detection)
 
-        btn_style = {
-            "font": ("Segoe UI", 10),
-            "relief": "flat",
-            "cursor": "hand2",
-            "pady": 8
-        }
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.clicked.connect(self.clear_all)
 
-        self.load_btn = tk.Button(parent, text="Load Image",
-                                  bg=COLORS["accent_blue"], fg="#1e1e2e",
-                                  command=self.load_image, **btn_style)
-        self.load_btn.pack(fill="x", padx=16, pady=4)
+        self.vehicle_combo = QComboBox()
+        self.vehicle_combo.addItems(["Auto-detect"] + VEHICLE_TYPES)
 
-        self.run_btn = tk.Button(parent, text="Run Detection",
-                                 bg=COLORS["accent_green"], fg="#1e1e2e",
-                                 command=self.run_detection, state="disabled", **btn_style)
-        self.run_btn.pack(fill="x", padx=16, pady=4)
+        self.show_steps_checkbox = QCheckBox("Enable")
 
-        tk.Button(parent, text="Clear", bg=COLORS["foreground"],
-                  fg=COLORS["text_primary"], command=self.clear_all, **btn_style).pack(fill="x", padx=16, pady=4)
+        self.area_value_lbl = QLabel("Min plate area: 0.3%")
+        self.area_slider = QSlider(Qt.Horizontal)
+        self.area_slider.setRange(1, 20)
+        self.area_slider.setValue(3)
+        self.area_slider.valueChanged.connect(self._update_area_label)
 
-        # Vehicle Type
-        tk.Label(parent, text="Vehicle type", font=("Segoe UI", 9),
-                 fg=COLORS["text_secondary"], bg=COLORS["background"]).pack(pady=(20, 4))
-        self.vehicle_var = tk.StringVar(value="Auto-detect")
-        ttk.Combobox(parent, textvariable=self.vehicle_var,
-                     values=["Auto-detect"] + VEHICLE_TYPES, state="readonly").pack(fill="x", padx=16)
+        layout.addWidget(heading)
+        layout.addWidget(self.load_btn)
+        layout.addWidget(self.run_btn)
+        layout.addWidget(self.clear_btn)
+        layout.addSpacing(14)
+        layout.addWidget(self._small_label("Vehicle type"))
+        layout.addWidget(self.vehicle_combo)
+        layout.addSpacing(10)
+        layout.addWidget(self._small_label("Show preprocessing steps"))
+        layout.addWidget(self.show_steps_checkbox)
+        layout.addSpacing(10)
+        layout.addWidget(self.area_value_lbl)
+        layout.addWidget(self.area_slider)
+        layout.addStretch(1)
+        return panel
 
-        # Preprocessing toggle
-        tk.Label(parent, text="Show preprocessing steps", font=("Segoe UI", 9),
-                 fg=COLORS["text_secondary"], bg=COLORS["background"]).pack(pady=(20, 4))
-        self.show_steps_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(parent, text="Enable", variable=self.show_steps_var,
-                       bg=COLORS["background"], fg=COLORS["text_primary"],
-                       selectcolor="#313244", activebackground=COLORS["background"],
-                       font=("Segoe UI", 9)).pack(padx=16, anchor="w")
+    def _build_image_area(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
 
-        # Min area slider
-        tk.Label(parent, text="Min plate area (%)", font=("Segoe UI", 9),
-                 fg=COLORS["text_secondary"], bg=COLORS["background"]).pack(pady=(16, 4))
-        self.area_var = tk.DoubleVar(value=0.3)
-        tk.Scale(parent, from_=0.1, to=2.0, resolution=0.1,
-                 variable=self.area_var, orient="horizontal",
-                 bg=COLORS["background"], fg=COLORS["text_primary"],
-                 troughcolor="#313244", highlightthickness=0).pack(fill="x", padx=16)
+        label = QLabel("Image preview")
+        label.setObjectName("smallLabel")
+        self.image_preview = ImagePreview()
 
-    def _build_canvas(self, parent):
-        tk.Label(parent, text="Image preview", font=("Segoe UI", 10),
-                 fg=COLORS["text_secondary"], bg=COLORS["background"]).pack(anchor="w", pady=(0, 4))
+        layout.addWidget(label)
+        layout.addWidget(self.image_preview, 1)
+        return panel
 
-        canvas_frame = tk.Frame(parent, bg=COLORS["foreground"], relief="flat", bd=1)
-        canvas_frame.pack(fill="both", expand=True)
+    def _build_results(self):
+        panel = QFrame()
+        panel.setObjectName("sidePanel")
+        panel.setFixedWidth(280)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(8)
 
-        self.canvas = tk.Canvas(canvas_frame, bg=COLORS["foreground"], highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
-        self.canvas.bind("<Configure>", lambda e: self._refresh_canvas())
+        heading = QLabel("Detection results")
+        heading.setObjectName("sectionHeading")
 
-        self.canvas_hint = self.canvas.create_text(
-            400, 250, text="Load an image to begin",
-            font=("Segoe UI", 14), fill="#ffffff")
+        self.plate_lbl = self._result_value("Not detected", "plateValue")
+        self.state_lbl = self._result_value("-", "stateValue")
+        self.prefix_lbl = self._result_value("-", "normalValue")
+        self.vtype_lbl = self._result_value("-", "vehicleValue")
+        self.count_lbl = self._result_value("-", "normalValue")
+        self.cand_list = QListWidget()
+        self.cand_list.setObjectName("candidateList")
+        self.cand_list.setMinimumHeight(90)
 
-    def _build_results(self, parent):
-        tk.Label(parent, text="Detection results", font=("Segoe UI", 12, "bold"),
-                 fg=COLORS["text_primary"], bg=COLORS["background"]).pack(pady=(16, 8), padx=16, anchor="w")
+        self.save_btn = QPushButton("Save result image")
+        self.save_btn.clicked.connect(self.save_result)
 
-        self.plate_var = tk.StringVar(value="—")
-        self.state_var = tk.StringVar(value="—")
-        self.prefix_var = tk.StringVar(value="—")
-        self.vtype_var = tk.StringVar(value="—")
-        self.count_var = tk.StringVar(value="—")
+        layout.addWidget(heading)
+        layout.addWidget(self._small_label("Plate text"))
+        layout.addWidget(self.plate_lbl)
+        layout.addWidget(self._small_label("Registered state"))
+        layout.addWidget(self.state_lbl)
+        layout.addWidget(self._small_label("Prefix detected"))
+        layout.addWidget(self.prefix_lbl)
+        layout.addWidget(self._small_label("Vehicle type"))
+        layout.addWidget(self.vtype_lbl)
+        layout.addWidget(self._small_label("Plates found"))
+        layout.addWidget(self.count_lbl)
+        layout.addWidget(self._small_label("All candidates"))
+        layout.addWidget(self.cand_list)
+        layout.addStretch(1)
+        layout.addWidget(self.save_btn)
+        return panel
 
-        self._result_row(parent, "Plate text")
-        tk.Label(parent, textvariable=self.plate_var,
-                 font=("Courier New", 20, "bold"), fg=COLORS["accent_pink"],
-                 bg=COLORS["background"]).pack(padx=16, anchor="w")
+    def _small_label(self, text):
+        label = QLabel(text)
+        label.setObjectName("smallLabel")
+        return label
 
-        self._result_row(parent, "Registered state")
-        tk.Label(parent, textvariable=self.state_var,
-                 font=("Segoe UI", 14, "bold"), fg=COLORS["accent_green"],
-                 bg=COLORS["background"]).pack(padx=16, anchor="w")
+    def _result_value(self, text, object_name):
+        label = QLabel(text)
+        label.setObjectName(object_name)
+        label.setWordWrap(True)
+        return label
 
-        self._result_row(parent, "Prefix detected")
-        tk.Label(parent, textvariable=self.prefix_var,
-                 font=("Segoe UI", 11), fg="#89dceb", bg=COLORS["background"]).pack(padx=16, anchor="w")
-
-        self._result_row(parent, "Vehicle type")
-        tk.Label(parent, textvariable=self.vtype_var,
-                 font=("Segoe UI", 11), fg=COLORS["accent_yellow"],
-                 bg=COLORS["background"]).pack(padx=16, anchor="w")
-
-        self._result_row(parent, "Plates found")
-        tk.Label(parent, textvariable=self.count_var,
-                 font=("Segoe UI", 11), fg=COLORS["text_primary"],
-                 bg=COLORS["background"]).pack(padx=16, anchor="w")
-
-        self._result_row(parent, "All candidates")
-        self.cand_list = tk.Listbox(parent, bg=COLORS["foreground"], fg=COLORS["text_primary"],
-                                    font=("Courier New", 10), height=6,
-                                    selectbackground="#585b70", relief="flat",
-                                    highlightthickness=0)
-        self.cand_list.pack(fill="x", padx=16, pady=(4, 0))
-
-        tk.Button(parent, text="Save result image", font=("Segoe UI", 9),
-                  bg=COLORS["accent_purple"], fg="#1e1e2e", relief="flat", cursor="hand2",
-                  command=self.save_result).pack(fill="x", padx=16, pady=16)
-
-    def _result_row(self, parent, label):
-        tk.Label(parent, text=label, font=("Segoe UI", 8),
-                 fg=COLORS["text_muted"], bg=COLORS["background"]).pack(
-            padx=16, anchor="w", pady=(12, 0))
+    def _apply_styles(self):
+        self.setStyleSheet(f"""
+            QWidget#root {{
+                background: {COLORS["background"]};
+                color: {COLORS["text_secondary"]};
+                font-family: "Segoe UI", sans-serif;
+                font-size: 10pt;
+            }}
+            QFrame#topbar {{
+                background: {COLORS["foreground"]};
+            }}
+            QLabel#topbarTitle {{
+                color: {COLORS["text_primary"]};
+            }}
+            QLabel#statusLabel {{
+                color: {COLORS["text_secondary"]};
+            }}
+            QFrame#sidePanel {{
+                background: {COLORS["background"]};
+            }}
+            QLabel#sectionHeading {{
+                color: {COLORS["text_primary"]};
+                font-weight: 700;
+                font-size: 12pt;
+            }}
+            QLabel#smallLabel {{
+                color: {COLORS["text_muted"]};
+                font-size: 9pt;
+            }}
+            QLabel#imagePreview {{
+                background: {COLORS["foreground"]};
+                color: white;
+            }}
+            QPushButton {{
+                border: 0;
+                padding: 9px 12px;
+                background: {COLORS["foreground"]};
+                color: #1e1e2e;
+            }}
+            QPushButton:hover {{
+                background: {COLORS["accent_purple"]};
+            }}
+            QPushButton:disabled {{
+                background: #cfc8c2;
+                color: #777777;
+            }}
+            QComboBox, QListWidget {{
+                background: {COLORS["foreground"]};
+                color: {COLORS["text_primary"]};
+                border: 0;
+                padding: 6px;
+            }}
+            QCheckBox {{
+                color: {COLORS["text_primary"]};
+            }}
+            QSlider::groove:horizontal {{
+                height: 8px;
+                background: #313244;
+            }}
+            QSlider::handle:horizontal {{
+                width: 16px;
+                margin: -4px 0;
+                background: white;
+                border: 1px solid #777777;
+            }}
+            QLabel#plateValue {{
+                color: {COLORS["accent_pink"]};
+                font: 700 20pt "Courier New";
+            }}
+            QLabel#stateValue {{
+                color: {COLORS["accent_green"]};
+                font-weight: 700;
+                font-size: 14pt;
+            }}
+            QLabel#vehicleValue {{
+                color: {COLORS["accent_yellow"]};
+            }}
+            QLabel#normalValue {{
+                color: {COLORS["text_secondary"]};
+            }}
+        """)
 
     # ------------------- OCR Loading -------------------
     def _load_ocr_async(self):
         def load():
             try:
-                self.reader = easyocr.Reader(["en"], gpu=False, verbose=False)
-                self.reader_loaded = True
-                self.after(0, lambda: self.status_lbl.config(
-                    text="Ready", fg=COLORS["accent_green"]))
-                if self.orig_img is not None:
-                    self.after(0, lambda: self.run_btn.config(state="normal"))
-            except Exception as e:
-                self.after(0, lambda: self.status_lbl.config(
-                    text=f"OCR error: {e}", fg=COLORS["error"]))
+                reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+                self.signals.ocr_ready.emit(reader)
+            except Exception as exc:
+                self.signals.ocr_error.emit(str(exc))
+
         threading.Thread(target=load, daemon=True).start()
+
+    def _on_ocr_ready(self, reader):
+        self.reader = reader
+        self.reader_loaded = True
+        self._set_status("Ready", COLORS["accent_green"])
+        self._sync_run_button()
+
+    def _on_ocr_error(self, message):
+        self._set_status(f"OCR error: {message}", COLORS["error"])
 
     # ------------------- Image Handling -------------------
     def load_image(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.gif *.tiff *.webp")])
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Image",
+            "",
+            "Image files (*.jpg *.jpeg *.png *.bmp *.gif *.tiff *.webp)",
+        )
         if not path:
             return
 
         self.orig_img = cv2.imread(path)
         if self.orig_img is None:
-            self.status_lbl.config(text="Failed to load image", fg=COLORS["error"])
+            self._set_status("Failed to load image", COLORS["error"])
             return
 
         self.result_img = self.orig_img.copy()
         self._display(self.orig_img)
-        self.status_lbl.config(text=f"Loaded: {os.path.basename(path)}",
-                               fg=COLORS["text_secondary"])
-
-        if self.reader_loaded:
-            self.run_btn.config(state="normal")
-
+        self._set_status(f"Loaded: {os.path.basename(path)}", COLORS["text_secondary"])
         self._reset_results()
+        self._sync_run_button()
 
     def _display(self, img_bgr):
         self._current_img_bgr = img_bgr.copy()
-        self._refresh_canvas()
-
-    def _refresh_canvas(self):
-        if not hasattr(self, "_current_img_bgr") or self._current_img_bgr is None:
-            return
-
-        self.canvas.delete("all")
-        cw = self.canvas.winfo_width() or 600
-        ch = self.canvas.winfo_height() or 400
-
-        img = self._current_img_bgr
-        ih, iw = img.shape[:2]
-        scale = min(cw / iw, ch / ih, 1.0)
-        nw, nh = int(iw * scale), int(ih * scale)
-
-        resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        pil = Image.fromarray(rgb)
-        self._tk_img = ImageTk.PhotoImage(pil)
-
-        ox, oy = (cw - nw) // 2, (ch - nh) // 2
-        self.canvas.create_image(ox, oy, anchor="nw", image=self._tk_img)
+        self.image_preview.set_cv_image(self._current_img_bgr)
 
     # ------------------- Detection Pipeline -------------------
     def run_detection(self):
         if self.orig_img is None or not self.reader_loaded:
             return
 
-        self.run_btn.config(state="disabled")
-        self.status_lbl.config(text="Processing...", fg=COLORS["text_highlight"])
-
+        self._detection_options = {
+            "min_area": (self.area_slider.value() / 10.0) / 100.0,
+            "vehicle_type": self.vehicle_combo.currentText(),
+            "show_steps": self.show_steps_checkbox.isChecked(),
+        }
+        self.run_btn.setEnabled(False)
+        self._set_status("Processing...", COLORS["text_highlight"])
         threading.Thread(target=self._detect_thread, daemon=True).start()
 
     def _detect_thread(self):
         try:
             img = self.orig_img.copy()
+            options = self._detection_options
             resized, gray, enhanced, edges, closed = preprocess(img)
-            min_area = self.area_var.get() / 100.0
+            min_area = options["min_area"]
             contour_boxes = detect_plates(resized, closed, min_area)
             dark_boxes = detect_dark_plate_regions(resized, min_area)
             bright_boxes = detect_bright_text_regions(resized)
@@ -1066,13 +1205,11 @@ class LPRApp(tk.Tk):
                     best_state = state
                     best_prefix = item["prefix"]
 
-            vtype = self.vehicle_var.get()
+            vtype = options["vehicle_type"]
             if vtype == "Auto-detect":
                 vtype = classify_vehicle(boxes, resized.shape)
 
-            # Preprocessing steps visualization
-            if self.show_steps_var.get():
-                # (Same logic as before - kept unchanged for brevity)
+            if options["show_steps"]:
                 steps = [
                     ("Grayscale", cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)),
                     ("CLAHE enhanced", cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)),
@@ -1094,64 +1231,87 @@ class LPRApp(tk.Tk):
                     offset += s.shape[1] + 4
                 draw = np.vstack([draw, strip])
 
-            self.result_img = draw
-            self.after(0, lambda: self._update_results(
-                best_text, best_state, best_prefix, vtype,
-                len(candidates), candidates, draw))
+            self.signals.detection_ready.emit({
+                "text": best_text,
+                "state": best_state,
+                "prefix": best_prefix,
+                "vehicle_type": vtype,
+                "count": len(candidates),
+                "candidates": candidates,
+                "draw": draw,
+            })
 
-        except Exception as e:
-            self.after(0, lambda: self.status_lbl.config(
-                text=f"Error: {e}", fg=COLORS["error"]))
-            self.after(0, lambda: self.run_btn.config(state="normal"))
+        except Exception as exc:
+            self.signals.detection_error.emit(str(exc))
 
-    def _update_results(self, text, state, prefix, vtype, count, candidates, draw):
-        self.plate_var.set(text if text else "Not detected")
-        self.state_var.set(state)
-        self.prefix_var.set(prefix if prefix else "—")
-        self.vtype_var.set(vtype)
-        self.count_var.set(str(count))
+    def _update_results(self, result):
+        self.result_img = result["draw"]
+        self.plate_lbl.setText(result["text"] if result["text"] else "Not detected")
+        self.state_lbl.setText(result["state"])
+        self.prefix_lbl.setText(result["prefix"] if result["prefix"] else "-")
+        self.vtype_lbl.setText(result["vehicle_type"])
+        self.count_lbl.setText(str(result["count"]))
 
-        self.cand_list.delete(0, "end")
-        for t, s in candidates:
-            self.cand_list.insert("end", f"{t:<12} → {s}")
+        self.cand_list.clear()
+        for text, state in result["candidates"]:
+            self.cand_list.addItem(f"{text:<12} -> {state}")
 
-        self._display(draw)
-        self.status_lbl.config(text="Detection complete", fg=COLORS["accent_green"])
-        self.run_btn.config(state="normal")
+        self._display(result["draw"])
+        self._set_status("Detection complete", COLORS["accent_green"])
+        self._sync_run_button()
+
+    def _on_detection_error(self, message):
+        self._set_status(f"Error: {message}", COLORS["error"])
+        self._sync_run_button()
 
     # ------------------- Utility Methods -------------------
+    def _update_area_label(self, value):
+        self.area_value_lbl.setText(f"Min plate area: {value / 10.0:.1f}%")
+
+    def _set_status(self, text, color):
+        self.status_lbl.setText(text)
+        self.status_lbl.setStyleSheet(f"color: {color};")
+
+    def _sync_run_button(self):
+        self.run_btn.setEnabled(self.orig_img is not None and self.reader_loaded)
+
     def _reset_results(self):
-        for var in [self.plate_var, self.state_var, self.prefix_var,
-                    self.vtype_var, self.count_var]:
-            var.set("—")
-        self.cand_list.delete(0, "end")
+        self.plate_lbl.setText("Not detected")
+        self.state_lbl.setText("-")
+        self.prefix_lbl.setText("-")
+        self.vtype_lbl.setText("-")
+        self.count_lbl.setText("-")
+        self.cand_list.clear()
 
     def clear_all(self):
         self.orig_img = None
         self.result_img = None
         self._current_img_bgr = None
-        self.canvas.delete("all")
-        self.canvas.create_text(400, 250, text="Load an image to begin",
-                                font=("Segoe UI", 14), fill="#45475a")
+        self.image_preview.clear_image()
         self._reset_results()
-        self.run_btn.config(state="disabled")
-        self.status_lbl.config(text="Ready", fg=COLORS["accent_green"])
+        self._sync_run_button()
+        status = "Ready" if self.reader_loaded else "Loading OCR engine..."
+        self._set_status(status, COLORS["accent_green"])
 
     def save_result(self):
         if self.result_img is None:
             return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".png",
-            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("HEIC", "*.heic")])
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save result image",
+            "",
+            "PNG (*.png);;JPEG (*.jpg *.jpeg);;HEIC (*.heic)",
+        )
         if path:
             cv2.imwrite(path, self.result_img)
-            self.status_lbl.config(text=f"Saved: {os.path.basename(path)}",
-                                   fg=COLORS["accent_green"])
+            self._set_status(f"Saved: {os.path.basename(path)}", COLORS["accent_green"])
 
 
 # =============================================
 # ENTRY POINT
 # =============================================
 if __name__ == "__main__":
-    app = LPRApp()
-    app.mainloop()
+    app = QApplication(sys.argv)
+    window = LPRApp()
+    window.show()
+    sys.exit(app.exec())
