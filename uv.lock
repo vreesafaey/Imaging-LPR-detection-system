@@ -2,10 +2,6 @@ version = 1
 revision = 3
 requires-python = ">=3.14"
 
-[options]
-exclude-newer = "2026-04-19T05:48:51.308905Z"
-exclude-newer-span = "P7D"
-
 [[package]]
 name = "cuda-bindings"
 version = "13.2.0"

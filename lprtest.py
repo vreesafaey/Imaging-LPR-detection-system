@@ -219,7 +219,7 @@ def is_probable_plate_text(text):
 
     patterns = [
         r"^[A-Z]{1,4}\d{1,5}[A-Z]?$",   # WAA1234, ZD12447, SMJ1234
-        r"^\d{1,5}[A-Z]{1,3}$",          # trade and some special plates
+        r"^[1-9]\d{2,5}[A-Z]{1,2}$",     # trade-style suffix plates (e.g. 670J)
         r"^\d{1,3}[A-Z]{1,3}\d{1,4}[A-Z]{0,3}$",
     ]
     return any(re.match(pattern, clean) for pattern in patterns)
@@ -568,7 +568,7 @@ def extract_plate_text(img_bgr, box, reader):
 
     crop = img_bgr[y:y + h, x:x + w]
     if crop.size == 0:
-        return ""
+        return "", 0.0
 
     # Upscale small crops
     if crop.shape[1] < 200:
@@ -600,27 +600,34 @@ def extract_plate_text(img_bgr, box, reader):
                 options.append((text, confidence))
 
     if not options:
-        return ""
+        return "", 0.0
 
     options = sorted(
         options,
         key=lambda item: (is_probable_plate_text(item[0]), len(item[0]), item[1]),
         reverse=True,
     )
-    return options[0][0]
+    return options[0]
 
 
 def identify_state(plate_text):
     """Match longest prefix first for accurate state identification."""
     alnum_text = normalize_plate_text(plate_text)
     for suffix, state in TRADE_SUFFIX_MAP.items():
-        if re.match(r"^[A-Z]{0,2}\d+[A-Z]?$", alnum_text) and alnum_text.endswith(suffix):
+        if re.match(r"^[A-Z]{0,2}\d{2,5}[A-Z]{1,2}$", alnum_text) and alnum_text.endswith(suffix):
             return state, suffix
 
-    plate_text = re.sub(r"[^A-Z]", "", alnum_text)
     for prefix in sorted(STATE_MAP, key=len, reverse=True):
-        if plate_text.startswith(prefix):
+        if not alnum_text.startswith(prefix):
+            continue
+        remainder = alnum_text[len(prefix):]
+        if re.search(r"\d", remainder):
             return STATE_MAP[prefix], prefix
+
+    # Diplomatic/organisation formats commonly end with CD/CC/DC/UN/PA.
+    for suffix in ("CD", "CC", "DC", "UN", "PA"):
+        if alnum_text.endswith(suffix) and re.match(r"^\d{2,4}[A-Z]{2,3}$", alnum_text):
+            return STATE_MAP[suffix], suffix
     return "No Plate Detected", ""
 
 
@@ -634,6 +641,41 @@ def candidate_score(text, state, confidence=0.0):
     if re.match(r"^Z[A-Z]{0,2}\d{3,5}$", clean):
         score += 2.0
     return score
+
+
+def is_plausible_plate_box(box, img_shape, source="image"):
+    x, y, w, h = box
+    ih, iw = img_shape[:2]
+    if w <= 0 or h <= 0:
+        return False
+
+    area_ratio = (w * h) / float(max(1, iw * ih))
+    aspect = w / float(h)
+    max_area = 0.12 if source.startswith("ocr") else 0.08
+
+    if not (0.00022 < area_ratio < max_area):
+        return False
+    if not (1.6 < aspect < 9.0):
+        return False
+    if w < 45 or h < 12:
+        return False
+    return True
+
+
+def is_strong_plate_candidate(text, state, confidence, box, img_shape, source="image"):
+    clean = normalize_plate_text(text)
+    if not is_probable_plate_text(clean):
+        return False
+    if not is_plausible_plate_box(box, img_shape, source):
+        return False
+
+    # OCR noise from signage or body stickers usually has low confidence and no
+    # valid state match. Keep those out unless confidence is reasonably high.
+    min_conf = 0.18 if source.startswith("ocr") else 0.30
+    if state == "No Plate Detected" and confidence < min_conf:
+        return False
+
+    return True
 
 
 def classify_vehicle(boxes, img_shape):
@@ -912,6 +954,8 @@ class LPRApp(tk.Tk):
             plate_regions = list(ocr_regions)
             image_regions = []
             for box in bright_boxes + contour_boxes + dark_boxes:
+                if not is_plausible_plate_box(box, resized.shape, source="image"):
+                    continue
                 if all(overlap_ratio(box, region["box"]) <= 0.65 for region in image_regions):
                     image_regions.append({
                         "box": box,
@@ -925,26 +969,90 @@ class LPRApp(tk.Tk):
             boxes = [region["box"] for region in plate_regions]
 
             draw = resized.copy()
-            candidates = []
+            filtered_candidates = []
             best_text = ""
-            best_state = "Unknown"
+            best_state = "No Plate Detected"
             best_prefix = ""
             best_score = -1.0
 
             for region in plate_regions:
                 box = region["box"]
-                text = region.get("text") or extract_plate_text(resized, box, self.reader)
+                source = region.get("source", "image")
+                text = normalize_plate_text(region.get("text", ""))
+                confidence = float(region.get("confidence", 0.0))
+
+                if not text:
+                    text, extracted_confidence = extract_plate_text(resized, box, self.reader)
+                    confidence = max(confidence, extracted_confidence)
                 text = normalize_plate_text(text)
                 if len(text) < 3:
                     continue
                 state, prefix = identify_state(text)
-                score = candidate_score(text, state, region.get("confidence", 0.0))
-                candidates.append((text, state))
 
-                x, y, w, h = box
+                # OCR regions can be oversized on stacked motorcycle plates.
+                # Re-anchor to a plausible overlapping image-derived box when available.
+                if source.startswith("ocr") and not is_plausible_plate_box(box, resized.shape, source):
+                    anchors = []
+                    for image_region in image_regions:
+                        anchor_box = image_region["box"]
+                        if overlap_ratio(box, anchor_box) > 0.55 and is_plausible_plate_box(
+                            anchor_box, resized.shape, source="image"
+                        ):
+                            anchors.append(anchor_box)
+                    if anchors:
+                        box = max(anchors, key=lambda b: b[2] * b[3])
+
+                if not is_strong_plate_candidate(
+                    text, state, confidence, box, resized.shape, source
+                ):
+                    continue
+
+                score = candidate_score(text, state, confidence)
+                if source.startswith("ocr"):
+                    score += 1.0
+
+                filtered_candidates.append({
+                    "text": text,
+                    "state": state,
+                    "prefix": prefix,
+                    "score": score,
+                    "box": box,
+                    "poly": region.get("poly"),
+                })
+
+            filtered_candidates = sorted(
+                filtered_candidates, key=lambda item: item["score"], reverse=True
+            )
+
+            selected = []
+            best_candidate_score = filtered_candidates[0]["score"] if filtered_candidates else -1.0
+            for cand in filtered_candidates:
+                if cand["score"] < 14.0:
+                    continue
+                if cand["score"] < best_candidate_score - 2.5:
+                    continue
+                if any(overlap_ratio(cand["box"], other["box"]) > 0.70 for other in selected):
+                    continue
+                if any(
+                    cand["text"] == other["text"] and overlap_ratio(cand["box"], other["box"]) > 0.40
+                    for other in selected
+                ):
+                    continue
+                selected.append(cand)
+                if len(selected) >= 6:
+                    break
+
+            candidates = [(item["text"], item["state"]) for item in selected]
+            boxes = [item["box"] for item in selected] or boxes
+
+            for item in selected:
+                x, y, w, h = item["box"]
+                state = item["state"]
+                text = item["text"]
+
                 color = (0, 255, 100) if state != "No Plate Detected" else (0, 180, 255)
-                if region.get("poly") is not None:
-                    cv2.polylines(draw, [region["poly"].astype(np.int32)], True, color, 2)
+                if item["poly"] is not None:
+                    cv2.polylines(draw, [item["poly"].astype(np.int32)], True, color, 2)
                 cv2.rectangle(draw, (x, y), (x + w, y + h), color, 2)
                 label = f"{text} | {state}"
                 (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
@@ -952,13 +1060,11 @@ class LPRApp(tk.Tk):
                 cv2.putText(draw, label, (x + 4, y - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
 
-                if score > best_score:
-                    best_score = score
-                    best_text, best_state, best_prefix = text, state, prefix
-
-            if not best_text and candidates:
-                best_text, best_state = candidates[0]
-                _, best_prefix = identify_state(best_text)
+                if item["score"] > best_score:
+                    best_score = item["score"]
+                    best_text = text
+                    best_state = state
+                    best_prefix = item["prefix"]
 
             vtype = self.vehicle_var.get()
             if vtype == "Auto-detect":
@@ -991,7 +1097,7 @@ class LPRApp(tk.Tk):
             self.result_img = draw
             self.after(0, lambda: self._update_results(
                 best_text, best_state, best_prefix, vtype,
-                len([c for c in candidates if c[0]]), candidates, draw))
+                len(candidates), candidates, draw))
 
         except Exception as e:
             self.after(0, lambda: self.status_lbl.config(
